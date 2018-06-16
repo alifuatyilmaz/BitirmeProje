@@ -20,11 +20,13 @@ package net.floodlightcontroller.loadbalancer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
 
 import org.projectfloodlight.openflow.protocol.OFFlowMod;
 import org.projectfloodlight.openflow.protocol.match.Match;
@@ -100,7 +102,7 @@ ILoadBalancerService, IOFMessageListener {
 
 	protected static Logger log = LoggerFactory.getLogger(LoadBalancer.class);
 
-	// Our dependencies
+	// Baðýmlýlýklarýmýz
 	protected IFloodlightProviderService floodlightProviderService;
 	protected IRestApiService restApiService;
 
@@ -121,11 +123,11 @@ ILoadBalancerService, IOFMessageListener {
 	protected HashMap<Integer, String> memberIpToId;
 	protected HashMap<IPClient, LBMember> clientToMember;
 
-	//Copied from Forwarding with message damper routine for pushing proxy Arp 
+	//Proxy ARP itme için ileti damper yordamýyla iletme kopyalanýr.
 	protected static String LB_ETHER_TYPE = "0x800";
 	protected static int LB_PRIORITY = 32768;
 
-	// Comparator for sorting by SwitchCluster
+	// Karþýlaþtýrýcý SwitchCluster tarafýndan sýralama için
 	public Comparator<SwitchPort> clusterIdComparator =
 			new Comparator<SwitchPort>() {
 		@Override
@@ -136,7 +138,7 @@ ILoadBalancerService, IOFMessageListener {
 		}
 	};
 
-	// data structure for storing connected
+	// baðlý depolama için veri yapýsý
 	public class IPClient {
 		IPv4Address ipAddress;
 		IpProtocol nw_proto;
@@ -150,6 +152,50 @@ ILoadBalancerService, IOFMessageListener {
 			targetPort = TransportPort.NONE;
 		}
 	}
+	
+	class Edge //kenar
+	{
+	 TransportPort source;
+	TransportPort dest;
+	int weight;
+
+	 public Edge(TransportPort srcPort, TransportPort targetPort, int weight) {
+	     this.source = srcPort;//kaynak
+	     this.dest = targetPort;//hedef
+	     this.weight = 1;//aðýrlýk
+	 }
+	};
+
+	class Node //düðüm
+	{
+		 int vertex, weight;
+
+		 public Node(int vertex, int weight) {
+		     this.vertex = 1;//köþe
+		     this.weight = 1;//aðýrlýk
+		 }
+	};
+
+	class Graph //graf
+	{
+	 // Bitiþik liste listesini temsil eden bir liste dizisi
+	 List<List<Edge>> adjList = null;
+
+	 // Constructor
+	 Graph(List<Edge> edges, int N)
+	 {
+	     adjList = new ArrayList<>(N);
+
+	     for (int i = 0; i < N; i++) {
+	         adjList.add(i, new ArrayList<>());
+	     }
+
+	     // kenarlarý iþaretsiz grafiðe ekleme
+	     for (Edge edge: edges) {
+	         adjList.get(edge.source).add(edge);
+	     }
+	 }
+}
 
 	@Override
 	public String getName() {
@@ -167,6 +213,55 @@ ILoadBalancerService, IOFMessageListener {
 	@Override
 	public boolean isCallbackOrderingPostreq(OFType type, String name) {
 		return (type.equals(OFType.PACKET_IN) && name.equals("forwarding"));
+	}
+	
+	public void shortestPath(Graph graph, int source, int N) 
+	{
+	     // min öbek oluþturma ve kaynak düðüm 0 uzaklýk itme
+	     PriorityQueue<Node> minHeap = new PriorityQueue<>((lhs, rhs) -> lhs.weight - rhs.weight);
+	     minHeap.add(new Node(source, 0));
+
+	     // kaynaktan V'ye sonsuz mesafe ayarlama
+	     List<Integer> dist = new ArrayList<>(Collections.nCopies(N, Integer.MAX_VALUE));
+
+	     // kaynaktan kendisine uzaklýk sýfýr
+	     dist.set(source, 0);
+
+	     // boolean array hangi minimum vertices izlemek için
+	     // maliyet zaten bulundu
+	     boolean[] done = new boolean[N];
+	     done[0] = true;
+
+	     // bir vertex'in öncülünü saklar (yolu yazdýrmak için)
+	     int prev[] = new int[N];
+	     prev[0] = -1;
+
+	     // minheap boþ olana kadar koþ.
+	     while (!minHeap.isEmpty())
+	     {
+	         // En iyi vertex çýkarýn ve geri dönün
+	         Node node = minHeap.poll();
+
+	         // köþe numarasýný al
+	         int u = node.vertex;
+
+	         // u her komþu V için yap
+	         for (Edge edge: graph.adjList.get(u))
+	         {
+	             int v = edge.dest;
+	             int weight = edge.weight;
+
+	             // Gevþeme adýmý
+	             if (!done[v] && (dist.get(u) + weight) < dist.get(v))
+	             {
+	                 dist.set(v, dist.get(u) + weight);
+	                 prev[v] = u;
+	                 minHeap.add(new Node(v, dist.get(v)));
+	             }
+	         }
+	      // bu yüzden bir daha alýnmayacak.
+	         done[u] = true;
+	     }           
 	}
 
 	@Override
@@ -188,9 +283,9 @@ ILoadBalancerService, IOFMessageListener {
 		IPacket pkt = eth.getPayload(); 	
 
 		if (eth.isBroadcast() || eth.isMulticast()) {
-			// handle ARP for VIP
+			// VIP için ARP kolu
 			if (pkt instanceof ARP) {
-				// retrieve arp to determine target IP address                                                       
+				// hedef IP adresi belirlemek için ARP al                                                     
 				ARP arpRequest = (ARP) eth.getPayload();
 
 				IPv4Address targetProtocolAddress = arpRequest.getTargetProtocolAddress();
@@ -201,12 +296,14 @@ ILoadBalancerService, IOFMessageListener {
 					return Command.STOP;
 				}
 			}
-		} else {
-			// currently only load balance IPv4 packets - no-op for other traffic 
+		} else 
+			{
+			// þu anda yalnýzca yük dengesi IPv4 paketleri - diðer trafik için no-op
 			if (pkt instanceof IPv4) {
 				IPv4 ip_pkt = (IPv4) pkt;
 
-				// If match Vip and port, check pool and choose member
+				// Eðer VIP ve port ile eþleþirse, havuzu kontrol edin ve üye seçin
+				
 				int destIpAddress = ip_pkt.getDestinationAddress().getInt();
 
 				if (vipIpToId.containsKey(destIpAddress)){
@@ -219,22 +316,68 @@ ILoadBalancerService, IOFMessageListener {
 
 						client.srcPort = tcp_pkt.getSourcePort();
 						client.targetPort = tcp_pkt.getDestinationPort();
+						
+						TransportPort srcPort = client.srcPort;
+						TransportPort targetPort = client.targetPort;
+						List<Edge> edges = Arrays.asList(
+		                        new Edge(srcPort, targetPort, 1), new Edge(srcPort, targetPort, 1)//Tip dönüþümü yap int'ten TransportPort'a
+		                        
+		                );
+		                
+		                // Grafikteki köþe sayýsýný ayarlama
+		                final int N = 7;
+
+		                // construct graph
+		                Graph graph = new Graph(edges, N);
+
+		                shortestPath(graph, 0, N);
+		            
 					}
 					if (ip_pkt.getPayload() instanceof UDP) {
 						UDP udp_pkt = (UDP) ip_pkt.getPayload();
 						client.srcPort = udp_pkt.getSourcePort();
 						client.targetPort = udp_pkt.getDestinationPort();
+						
+						TransportPort srcPort = client.srcPort;
+						TransportPort targetPort = client.targetPort;
+						List<Edge> edges = Arrays.asList(
+		                        new Edge(srcPort, targetPort, 1), new Edge(srcPort, targetPort, 1)//Tip dönüþümü yap int'ten TransportPort'a
+		                        
+		                );
+		                
+		                // Grafikteki köþe sayýsýný ayarlama
+		                final int N = 7;
+
+		                // construct graph
+		                Graph graph = new Graph(edges, N);
+
+		                shortestPath(graph, 0, N);
 					}
 					if (ip_pkt.getPayload() instanceof ICMP) {
 						client.srcPort = TransportPort.of(8); 
 						client.targetPort = TransportPort.of(0); 
+					
+						TransportPort srcPort = client.srcPort;
+						TransportPort targetPort = client.targetPort;
+						List<Edge> edges = Arrays.asList(
+		                        new Edge(srcPort, targetPort, 1), new Edge(srcPort, targetPort, 1)//Tip dönüþümü yap int'ten TransportPort'a
+		                       
+		                );
+		                
+		                // Grafikteki köþe sayýsýný ayarlama
+		                final int N = 7;
+
+		                // construct graph
+		                Graph graph = new Graph(edges, N);
+
+		                shortestPath(graph, 0, N);
 					}
 
 					LBVip vip = vips.get(vipIpToId.get(destIpAddress));
-					if (vip == null)			// fix dereference violations           
+					if (vip == null)			// dereferences ihlallerini Düzelt          
 						return Command.CONTINUE;
 					LBPool pool = pools.get(vip.pickPool(client));
-					if (pool == null)			// fix dereference violations
+					if (pool == null)			// dereferences ihlallerini Düzelt
 						return Command.CONTINUE;
 
 					HashMap<String, Short> memberWeights = new HashMap<String, Short>();
@@ -245,18 +388,18 @@ ILoadBalancerService, IOFMessageListener {
 							memberWeights.put(memberId,members.get(memberId).weight);
 						}
 					}
-					// Switch statistics collection
+					// Anahtar veri toplama
 					if(pool.lbMethod == LBPool.STATISTICS && statisticsService != null)
 						memberPortBandwidth = collectSwitchPortBandwidth();
 					
 					LBMember member = members.get(pool.pickMember(client,memberPortBandwidth,memberWeights));
-					if(member == null)			//fix dereference violations
+					if(member == null)			//dereferences ihlallerini Düzelt
 						return Command.CONTINUE;
 
-					// for chosen member, check device manager and find and push routes, in both directions                    
+					// seçilen üye için Aygýt Yöneticisi'ni kontrol edin ve her iki yönde de rotalarý bulun ve itin.                   
 					pushBidirectionalVipRoutes(sw, pi, cntx, client, member);
 
-					// packet out based on table rule
+					// tablo kuralýna göre paket dýþý
 					pushPacket(pkt, sw, pi.getBufferId(), (pi.getVersion().compareTo(OFVersion.OF_12) < 0) ? pi.getInPort() : pi.getMatch().get(MatchField.IN_PORT), OFPort.TABLE,
 							cntx, true);
 
@@ -265,7 +408,7 @@ ILoadBalancerService, IOFMessageListener {
 				}
 			}
 		}
-		// bypass non-load-balanced traffic for normal processing (forwarding)
+		// normal iþlem için yük dengeleyici olmayan trafiði bypass (iletme)
 		return Command.CONTINUE;
 	}
 
@@ -277,7 +420,7 @@ ILoadBalancerService, IOFMessageListener {
 		HashMap<String,U64> memberPortBandwidth = new HashMap<String, U64>();
 		HashMap<IDevice,String> deviceToMemberId = new HashMap<IDevice, String>();
 
-		// retrieve all known devices to know which ones are attached to the members
+		// Hangi üyelerin üyelere baðlý olduðunu bilmek için bilinen tüm cihazlarý al
 		Collection<? extends IDevice> allDevices = deviceManagerService.getAllDevices();
 
 		for (IDevice d : allDevices) {
@@ -290,13 +433,13 @@ ILoadBalancerService, IOFMessageListener {
 				}
 			}
 		}
-		// collect statistics of the switch ports attached to the members
+		// üyelere baðlý anahtar portlarýnýn istatistiklerini toplamak
 		if(deviceToMemberId !=null){
 			for(IDevice membersDevice: deviceToMemberId.keySet()){
 				String memberId = deviceToMemberId.get(membersDevice);
 				for(SwitchPort dstDap: membersDevice.getAttachmentPoints()){					
 					SwitchPortBandwidth bandwidthOfPort = statisticsService.getBandwidthConsumption(dstDap.getNodeId(), dstDap.getPortId());
-					if(bandwidthOfPort != null) // needs time for 1st collection, this avoids nullPointerException 
+					if(bandwidthOfPort != null) // 1. koleksiyon için zamana ihtiyacý vardýr, bu nullPointerException'ý önler 
 						memberPortBandwidth.put(memberId, bandwidthOfPort.getBitsPerSecondRx());
 				}
 			}
@@ -305,7 +448,7 @@ ILoadBalancerService, IOFMessageListener {
 	}
 
 	/**
-	 * used to send proxy Arp for load balanced service requests
+	 * yük dengeli servis istekleri için proxy Arp göndermek için kullanýlýr
 	 * @param IOFSwitch sw
 	 * @param OFPacketIn pi
 	 * @param FloodlightContext cntx
@@ -318,14 +461,14 @@ ILoadBalancerService, IOFMessageListener {
 		Ethernet eth = IFloodlightProviderService.bcStore.get(cntx,
 				IFloodlightProviderService.CONTEXT_PI_PAYLOAD);
 
-		// retrieve original arp to determine host configured gw IP address                                          
+		// host yapýlandýrýlmýþ gw IP adresini belirlemek için orijinal arp almak                                          
 		if (! (eth.getPayload() instanceof ARP))
 			return;
 		ARP arpRequest = (ARP) eth.getPayload();
 
-		// have to do proxy arp reply since at this point we cannot determine the requesting application type
+		// bu noktada proxy arp cevabý yapmak zorundayýz çünkü bu noktada talepte bulunan baþvuru tipini belirleyemiyoruz
 
-		// generate proxy ARP reply
+		// proxy ARP yanýtý oluþtur
 		IPacket arpReply = new Ethernet()
 				.setSourceMACAddress(vips.get(vipId).proxyMac)
 				.setDestinationMACAddress(eth.getSourceMACAddress())
@@ -344,7 +487,7 @@ ILoadBalancerService, IOFMessageListener {
 						.setTargetHardwareAddress(eth.getSourceMACAddress())
 						.setTargetProtocolAddress(arpRequest.getSenderProtocolAddress()));
 
-		// push ARP reply out
+		// ARP yanýtýný dýþarý aktar
 		pushPacket(arpReply, sw, OFBufferId.NO_BUFFER, OFPort.ANY, (pi.getVersion().compareTo(OFVersion.OF_12) < 0 ? pi.getInPort() : pi.getMatch().get(MatchField.IN_PORT)), cntx, true);
 		log.debug("proxy ARP reply pushed as {}", IPv4.fromIPv4Address(vips.get(vipId).address));
 
@@ -352,7 +495,7 @@ ILoadBalancerService, IOFMessageListener {
 	}
 
 	/**
-	 * used to push any packet - borrowed routine from Forwarding
+	 * Herhangi bir paketi itmek için kullanýlýr - Ödünç alýnan rutini
 	 * 
 	 * @param OFPacketIn pi
 	 * @param IOFSwitch sw
@@ -376,7 +519,7 @@ ILoadBalancerService, IOFMessageListener {
 
 		OFPacketOut.Builder pob = sw.getOFFactory().buildPacketOut();
 
-		// set actions
+		// eylemleri ayarla
 		List<OFAction> actions = new ArrayList<OFAction>();
 		actions.add(sw.getOFFactory().actions().buildOutput().setPort(outPort).setMaxLen(Integer.MAX_VALUE).build());
 
@@ -415,12 +558,12 @@ ILoadBalancerService, IOFMessageListener {
 	 */
 	protected void pushBidirectionalVipRoutes(IOFSwitch sw, OFPacketIn pi, FloodlightContext cntx, IPClient client, LBMember member) {
 
-		// borrowed code from Forwarding to retrieve src and dst device entities
-		// Check if we have the location of the destination
+		// src ve dst cihaz varlýklarý almak için Yönlendirme'den ödünç alýnan kod
+		// Hedefin yerinin olup olmadýðýný kontrol et
 		IDevice srcDevice = null;
 		IDevice dstDevice = null;
 
-		// retrieve all known devices
+		// bilinen tüm cihazlarý al
 		Collection<? extends IDevice> allDevices = deviceManagerService.getAllDevices();
 
 		for (IDevice d : allDevices) {
@@ -436,7 +579,7 @@ ILoadBalancerService, IOFMessageListener {
 			}
 		}  
 
-		// srcDevice and/or dstDevice is null, no route can be pushed
+		// srcDevice ve / veya dstDevice boþ, hiçbir rota itilemez
 		if (srcDevice == null || dstDevice == null) return;
 
 		DatapathId srcIsland = topologyService.getClusterId(sw.getId());
@@ -447,8 +590,8 @@ ILoadBalancerService, IOFMessageListener {
 			return;
 		}
 
-		// Validate that we have a destination known on the same island
-		// Validate that the source and destination are not on the same switchport
+		// Ayný adada bilinen bir hedefimiz olduðunu doðrulayýn
+		// Kaynak ve hedefin ayný geçiþte olmadýðýný doðrulayýn.
 		boolean on_same_island = false;
 		boolean on_same_if = false;
 		//Switch
@@ -482,9 +625,8 @@ ILoadBalancerService, IOFMessageListener {
 			return;
 		}	
 
-		// Install all the routes where both src and dst have attachment
-		// points.  Since the lists are stored in sorted order we can 
-		// traverse the attachment points in O(m+n) time
+		// Hem src hem de dst'nin ek noktalarý olan tüm rotalarý yükleyin.
+		// Listeler sýralanmýþ sýrayla depolandýðýndan, ek noktalarýn O (m + n) zamanýnda hareket edebilmesi
 		SwitchPort[] srcDaps = srcDevice.getAttachmentPoints();
 		Arrays.sort(srcDaps, clusterIdComparator);
 		SwitchPort[] dstDaps = dstDevice.getAttachmentPoints();
@@ -492,8 +634,7 @@ ILoadBalancerService, IOFMessageListener {
 
 		int iSrcDaps = 0, iDstDaps = 0;
 
-		// following Forwarding's same routing routine, retrieve both in-bound and out-bound routes for
-		// all clusters.
+		// Forwarding'in ayný yönlendirme rutinini takip ederek, tüm kümeler için hem gelen hem de dýþ hat rotalarýný alýn.
 		while ((iSrcDaps < srcDaps.length) && (iDstDaps < dstDaps.length)) {
 			SwitchPort srcDap = srcDaps[iSrcDaps];
 			SwitchPort dstDap = dstDaps[iDstDaps];
@@ -518,9 +659,9 @@ ILoadBalancerService, IOFMessageListener {
 									srcDap.getNodeId(),
 									srcDap.getPortId());
 
-					// use static flow entry pusher to push flow mod along in and out path
-					// in: match src client (ip, port), rewrite dest from vip ip/port to member ip/port, forward
-					// out: match dest client (ip, port), rewrite src from member ip/port to vip ip/port, forward
+					// giriþ ve çýkýþ yolu boyunca akýþ modunu itmek için statik akýþ giriþ iticisini kullanýn
+					// in: eþleme src istemcisi (ip, baðlantý noktasý), vip ip / baðlantý noktasýndan üye ip / baðlantý noktasýna yeniden yazma, iletme
+					// out: dest istemcisi (ip, port) eþleþir, üye ip / porttan src'yi vip ip / port'a yeniden yazar, ileri
 
 					if (! routeIn.getPath().isEmpty()) {
 						pushStaticVipRoute(true, routeIn, client, member, sw);
@@ -543,7 +684,7 @@ ILoadBalancerService, IOFMessageListener {
 	}
 
 	/**
-	 * used to push given route using static flow entry pusher
+	 * statik akýþ giriþi itici kullanarak verilen rotayý itmek için kullanýlýr
 	 * @param boolean inBound
 	 * @param Path route
 	 * @param IPClient client
@@ -602,7 +743,7 @@ ILoadBalancerService, IOFMessageListener {
 							actions.add(pinSwitch.getOFFactory().actions().output(path.get(i+1).getPortId(), Integer.MAX_VALUE));
 						}
 					} else {
-						//fix concurrency errors
+						//eþzamanlýlýk hatalarýný düzeltin
 						try{
 							actions.add(switchService.getSwitch(path.get(i+1).getNodeId()).getOFFactory().actions().output(path.get(i+1).getPortId(), Integer.MAX_VALUE));
 						}
@@ -642,7 +783,7 @@ ILoadBalancerService, IOFMessageListener {
 
 						}
 					} else {
-						//fix concurrency errors
+						//eþzamanlýlýk hatalarýný düzeltin
 						try{
 							actions.add(switchService.getSwitch(path.get(i+1).getNodeId()).getOFFactory().actions().output(path.get(i+1).getPortId(), Integer.MAX_VALUE));
 						}
@@ -743,7 +884,7 @@ ILoadBalancerService, IOFMessageListener {
 		LBPool pool;
 		if (pools != null) {
 			pool = pools.get(poolId);
-			if (pool == null)	// fix dereference violations
+			if (pool == null)	// dereference ihlallerini düzelt
 				return -1;
 			if (pool.vipId != null && vips.containsKey(pool.vipId))
 				vips.get(pool.vipId).pools.remove(poolId);
